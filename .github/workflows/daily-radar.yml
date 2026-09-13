@@ -1,0 +1,35 @@
+name: Daily Taiwan Momentum Radar
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 11 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - run: pip install -e .
+      - name: Run radar
+        run: python -m radar.cli run
+      - name: Commit report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/
+          if git diff --cached --quiet; then
+            echo "No report changes"
+          else
+            git commit -m "data: update momentum radar"
+            git push
+          fi
