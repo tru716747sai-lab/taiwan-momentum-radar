@@ -11,6 +11,7 @@ from .scoring import (
     score_breakout,
     score_ignition,
 )
+from .tracking import update_ignition_tracking
 
 
 def _merge_universe(
@@ -23,6 +24,22 @@ def _merge_universe(
         on="ticker",
         how="left",
     )
+
+
+def _add_trade_cost_columns(
+    df,
+):
+
+    x = df.copy()
+
+    if "price" in x.columns:
+
+        x["lot_cost"] = (
+            x["price"]
+            * 1000
+        )
+
+    return x
 
 
 def _percent_for_display(
@@ -124,6 +141,12 @@ def run(cfg):
         universe,
     )
 
+    strong_ranked = (
+        _add_trade_cost_columns(
+            strong_ranked
+        )
+    )
+
     strong = (
         strong_ranked
         .head(top_n)
@@ -148,6 +171,12 @@ def run(cfg):
         universe,
     )
 
+    breakout_ranked = (
+        _add_trade_cost_columns(
+            breakout_ranked
+        )
+    )
+
     breakout = (
         breakout_ranked
         .head(top_n)
@@ -170,8 +199,7 @@ def run(cfg):
     # =========================================================
     # HARD FILTER
     #
-    # 不做任何空榜救援。
-    #
+    # 不做空榜救援。
     # 沒有合格股票就是空榜。
     # =========================================================
 
@@ -192,6 +220,18 @@ def run(cfg):
     ignition_qualified = _merge_universe(
         ignition_qualified_raw,
         universe,
+    )
+
+    ignition_ranked = (
+        _add_trade_cost_columns(
+            ignition_ranked
+        )
+    )
+
+    ignition_qualified = (
+        _add_trade_cost_columns(
+            ignition_qualified
+        )
     )
 
     ignition = (
@@ -273,15 +313,37 @@ def run(cfg):
     )
 
     # =========================================================
-    # Markdown report
+    # Data Date
     # =========================================================
 
     data_date = (
         close.index.max().date()
     )
 
+    # =========================================================
+    # v2.3 Ignition Tracking
+    #
+    # 第一次進 Ignition = Day 0
+    #
+    # 未來 Daily 自動更新：
+    # D+1 / D+3 / D+5 / D+10 / D+20
+    # =========================================================
+
+    ignition_tracking = (
+        update_ignition_tracking(
+            ignition=ignition,
+            close=close,
+            data_date=data_date,
+            reports_dir=reports,
+        )
+    )
+
+    # =========================================================
+    # Markdown report
+    # =========================================================
+
     md = (
-        "# Taiwan Momentum Radar — v2.1\n\n"
+        "# Taiwan Momentum Radar — v2.3\n\n"
     )
 
     md += (
@@ -291,6 +353,12 @@ def run(cfg):
     md += (
         "三層 Radar："
         "**Strong / Breakout / Ignition**。\n\n"
+    )
+
+    md += (
+        "v2.3 新增："
+        "**目前價格、整張約需資金、"
+        "Ignition Day 0 與後續績效追蹤。**\n\n"
     )
 
     # =========================================================
@@ -314,11 +382,12 @@ def run(cfg):
             "name",
             "market",
             "score",
+            "price",
+            "lot_cost",
             "momentum_score",
             "trend_score",
             "liquidity_score",
             "risk_score",
-            "price",
             "ret_20",
             "ret_60",
             "ret_252",
@@ -353,6 +422,7 @@ def run(cfg):
             "market",
             "breakout_score",
             "price",
+            "lot_cost",
             "ret_5",
             "ret_20",
             "ret_60",
@@ -375,18 +445,19 @@ def run(cfg):
     md += (
         "\n\n"
         "## 3. Ignition — "
-        "異常啟動 Watchlist\n\n"
+        "早期異常啟動 Watchlist\n\n"
     )
 
     md += (
-        "尚未明顯過熱，"
+        "價格尚未明顯噴出，"
         "但量價開始出現不尋常變化的股票。\n\n"
     )
 
     md += (
-        "**硬條件：** "
-        "20日漲幅 < 60%、"
-        "60日漲幅 < 120%、"
+        "**v2.2 硬條件：** "
+        "-5% ≤ 5日報酬 < +20%、"
+        "20日漲幅 < +35%、"
+        "60日漲幅 < +70%、"
         "最近5日均量 ≥ 前20日均量1.5倍、"
         "不得高於前60日高點10%以上，"
         "且接近前高或短期 Momentum shift 轉強。\n\n"
@@ -402,6 +473,7 @@ def run(cfg):
             "ignition_score",
             "ignition_signal_count",
             "price",
+            "lot_cost",
             "ret_5",
             "ret_20",
             "ret_60",
@@ -418,12 +490,62 @@ def run(cfg):
     )
 
     # =========================================================
+    # Ignition Tracking
+    # =========================================================
+
+    md += (
+        "\n\n"
+        "## 4. Ignition — Day 0 績效追蹤\n\n"
+    )
+
+    md += (
+        "第一次進入 Ignition 的交易日定義為 "
+        "**Day 0**。同一股票連續入榜不重設 Day 0。\n\n"
+    )
+
+    md += (
+        "D+1 / D+3 / D+5 / D+10 / D+20 "
+        "均指後續**交易日**，不是曆日。\n\n"
+    )
+
+    md += _markdown_table(
+        ignition_tracking,
+        [
+            "signal_date",
+            "ticker",
+            "code",
+            "name",
+            "day0_price",
+            "lot_cost",
+            "ignition_score",
+            "day0_ret_5",
+            "day0_volume_ratio_5",
+            "d1_return",
+            "d3_return",
+            "d5_return",
+            "d10_return",
+            "d20_return",
+            "latest_return",
+            "trading_days_since_signal",
+        ],
+        [
+            "day0_ret_5",
+            "d1_return",
+            "d3_return",
+            "d5_return",
+            "d10_return",
+            "d20_return",
+            "latest_return",
+        ],
+    )
+
+    # =========================================================
     # Interpretation
     # =========================================================
 
     md += (
         "\n\n---\n\n"
-        "## 分數解讀\n\n"
+        "## 分數與追蹤解讀\n\n"
         "**Strong Score 高：** "
         "代表在 Strong 候選池中，"
         "目前中長期強勢程度相對較高。\n\n"
@@ -435,8 +557,11 @@ def run(cfg):
         "短期量價異常程度相對較高。\n\n"
         "**不同 Radar 的分數不可直接互相比較，"
         "也不是未來上漲機率或勝率。**\n\n"
-        "Momentum shift 僅供橫斷面排序，"
-        "不可解讀為實際價格加速度百分比。\n\n"
+        "Day 0 追蹤的目的，是驗證 "
+        "Ignition 首次發出訊號後，"
+        "未來究竟還有沒有後續報酬。\n\n"
+        "目前價格與整張資金只供實際操作判讀，"
+        "不影響 Radar 排名。\n\n"
         "> 研究排名，不構成投資建議。"
     )
 
@@ -451,4 +576,5 @@ def run(cfg):
         "strong": strong,
         "breakout": breakout,
         "ignition": ignition,
+        "ignition_tracking": ignition_tracking,
     }
