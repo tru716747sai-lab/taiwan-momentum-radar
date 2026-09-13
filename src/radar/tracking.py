@@ -4,6 +4,15 @@ import numpy as np
 import pandas as pd
 
 
+# =============================================================
+# Tracking Schema
+#
+# First Ignition = Day 0
+#
+# 目前只追蹤第一次進入 Ignition Top N 的訊號。
+# 同一股票連續或再次進榜，不重新建立 Day 0。
+# =============================================================
+
 TRACKING_COLUMNS = [
     "signal_date",
     "ticker",
@@ -31,12 +40,17 @@ TRACKING_COLUMNS = [
 
 
 def _empty_tracking():
+
     return pd.DataFrame(
         columns=TRACKING_COLUMNS
     )
 
 
-def _safe_value(row, column, default=np.nan):
+def _safe_value(
+    row,
+    column,
+    default=np.nan,
+):
 
     if column not in row.index:
         return default
@@ -44,10 +58,15 @@ def _safe_value(row, column, default=np.nan):
     return row[column]
 
 
-def _normalize_date(value):
-
-    return pd.Timestamp(value).normalize()
-
+# =============================================================
+# Signal Date Alignment
+#
+# yfinance / pandas 的 index 可能帶 timezone，
+# signal_date 則可能只是 YYYY-MM-DD。
+#
+# 統一移除 timezone 並 normalize，
+# 避免 Day 0 找不到，造成 D+1 永遠無法更新。
+# =============================================================
 
 def _find_signal_position(
     close_series,
@@ -59,22 +78,42 @@ def _find_signal_position(
     if valid.empty:
         return None, valid
 
-    index = pd.DatetimeIndex(valid.index)
+    index_dates = (
+        pd.DatetimeIndex(valid.index)
+        .tz_localize(None)
+        .normalize()
+    )
 
-    signal_date = _normalize_date(
-        signal_date
+    signal_date = (
+        pd.Timestamp(signal_date)
+        .tz_localize(None)
+        .normalize()
     )
 
     matches = np.where(
-        index.normalize()
-        == signal_date
+        index_dates == signal_date
     )[0]
 
     if len(matches) == 0:
         return None, valid
 
-    return int(matches[-1]), valid
+    return int(
+        matches[-1]
+    ), valid
 
+
+# =============================================================
+# Forward Return
+#
+# 定義：
+#
+# Day 0 收盤價
+# → 第 N 個後續交易日收盤價
+#
+# 注意：
+# 這不是下一交易日開盤可實際成交報酬，
+# 而是訊號後收盤績效追蹤。
+# =============================================================
 
 def _forward_return(
     valid_close,
@@ -83,10 +122,13 @@ def _forward_return(
 ):
 
     target_position = (
-        signal_position + horizon
+        signal_position
+        + horizon
     )
 
-    if target_position >= len(valid_close):
+    if target_position >= len(
+        valid_close
+    ):
         return np.nan
 
     day0_price = float(
@@ -111,12 +153,18 @@ def _forward_return(
     )
 
 
+# =============================================================
+# Update One Historical Signal
+# =============================================================
+
 def _update_one_signal(
     row,
     close,
 ):
 
-    ticker = row["ticker"]
+    ticker = str(
+        row["ticker"]
+    )
 
     if ticker not in close.columns:
         return row
@@ -146,9 +194,23 @@ def _update_one_signal(
         ]
     )
 
-    row["day0_price"] = day0_price
-    row["lot_cost"] = (
-        day0_price * 1000
+    row[
+        "day0_price"
+    ] = day0_price
+
+    # ---------------------------------------------------------
+    # 約略整張資金
+    #
+    # 普通股以 1,000 股估算。
+    # 僅供資金量級參考，不作為交易規則判定。
+    # 特殊市場／交易制度股票應另行確認。
+    # ---------------------------------------------------------
+
+    row[
+        "lot_cost"
+    ] = (
+        day0_price
+        * 1000
     )
 
     available_forward_days = (
@@ -163,6 +225,10 @@ def _update_one_signal(
         available_forward_days,
         0,
     )
+
+    # ---------------------------------------------------------
+    # D+1 / 3 / 5 / 10 / 20
+    # ---------------------------------------------------------
 
     for horizon in [
         1,
@@ -180,28 +246,34 @@ def _update_one_signal(
             horizon,
         )
 
-    if available_forward_days >= 0:
+    # ---------------------------------------------------------
+    # Latest Return
+    # ---------------------------------------------------------
 
-        latest_price = float(
-            valid_close.iloc[-1]
-        )
+    latest_price = float(
+        valid_close.iloc[-1]
+    )
+
+    row[
+        "latest_price"
+    ] = latest_price
+
+    if day0_price > 0:
 
         row[
-            "latest_price"
-        ] = latest_price
-
-        if day0_price > 0:
-
-            row[
-                "latest_return"
-            ] = (
-                latest_price
-                / day0_price
-                - 1
-            )
+            "latest_return"
+        ] = (
+            latest_price
+            / day0_price
+            - 1
+        )
 
     return row
 
+
+# =============================================================
+# Add Today's New Ignition Signals
+# =============================================================
 
 def _append_new_signals(
     tracking,
@@ -212,149 +284,131 @@ def _append_new_signals(
     if ignition.empty:
         return tracking
 
-    existing_keys = set()
-
-    if not tracking.empty:
-
-        existing_keys = set(
-            zip(
-                tracking[
-                    "signal_date"
-                ].astype(str),
-                tracking[
-                    "ticker"
-                ].astype(str),
-            )
-        )
-
-    new_rows = []
-
     for _, signal in ignition.iterrows():
 
         ticker = str(
             signal["ticker"]
         )
 
-        signal_date = str(
-            data_date
-        )
-
-        key = (
-            signal_date,
-            ticker,
-        )
-
         # -----------------------------------------------------
-        # 同一股票若已經有任何歷史 Day 0，
-        # 不因連續入榜而重新建立 Day 0。
+        # First Ignition Only
         #
-        # 也就是：
-        # First Ignition = Day 0
+        # 同一 ticker 曾經建立過 Day 0，
+        # 就不重新建立。
+        #
+        # 第一階段目的是驗證：
+        # Agent 第一次發出 Ignition 時，
+        # 後續到底還有沒有肉。
         # -----------------------------------------------------
-
-        already_tracked = False
 
         if not tracking.empty:
 
             already_tracked = (
                 tracking[
                     "ticker"
-                ].astype(str)
-                == ticker
-            ).any()
+                ]
+                .astype(str)
+                .eq(ticker)
+                .any()
+            )
 
-        if already_tracked:
-            continue
-
-        if key in existing_keys:
-            continue
+            if already_tracked:
+                continue
 
         price = float(
             signal["price"]
         )
 
-        new_rows.append(
-            {
-                "signal_date": signal_date,
-                "ticker": ticker,
-                "code": _safe_value(
-                    signal,
-                    "code",
-                    "",
-                ),
-                "name": _safe_value(
-                    signal,
-                    "name",
-                    "",
-                ),
-                "market": _safe_value(
-                    signal,
-                    "market",
-                    "",
-                ),
-                "day0_price": price,
-                "lot_cost": price * 1000,
-                "ignition_score": _safe_value(
-                    signal,
-                    "ignition_score",
-                ),
-                "ignition_signal_count": _safe_value(
-                    signal,
-                    "ignition_signal_count",
-                ),
-                "day0_ret_5": _safe_value(
-                    signal,
-                    "ret_5",
-                ),
-                "day0_ret_20": _safe_value(
-                    signal,
-                    "ret_20",
-                ),
-                "day0_ret_60": _safe_value(
-                    signal,
-                    "ret_60",
-                ),
-                "day0_volume_ratio_5": _safe_value(
-                    signal,
-                    "volume_ratio_5",
-                ),
-                "day0_distance_to_high_60": _safe_value(
-                    signal,
-                    "distance_to_high_60",
-                ),
-                "d1_return": np.nan,
-                "d3_return": np.nan,
-                "d5_return": np.nan,
-                "d10_return": np.nan,
-                "d20_return": np.nan,
-                "latest_return": 0.0,
-                "latest_price": price,
-                "trading_days_since_signal": 0,
-            }
+        new_row = {
+            "signal_date": str(
+                data_date
+            ),
+            "ticker": ticker,
+            "code": _safe_value(
+                signal,
+                "code",
+                "",
+            ),
+            "name": _safe_value(
+                signal,
+                "name",
+                "",
+            ),
+            "market": _safe_value(
+                signal,
+                "market",
+                "",
+            ),
+            "day0_price": price,
+            "lot_cost": (
+                price * 1000
+            ),
+            "ignition_score": _safe_value(
+                signal,
+                "ignition_score",
+            ),
+            "ignition_signal_count": _safe_value(
+                signal,
+                "ignition_signal_count",
+            ),
+            "day0_ret_5": _safe_value(
+                signal,
+                "ret_5",
+            ),
+            "day0_ret_20": _safe_value(
+                signal,
+                "ret_20",
+            ),
+            "day0_ret_60": _safe_value(
+                signal,
+                "ret_60",
+            ),
+            "day0_volume_ratio_5": _safe_value(
+                signal,
+                "volume_ratio_5",
+            ),
+            "day0_distance_to_high_60": _safe_value(
+                signal,
+                "distance_to_high_60",
+            ),
+            "d1_return": np.nan,
+            "d3_return": np.nan,
+            "d5_return": np.nan,
+            "d10_return": np.nan,
+            "d20_return": np.nan,
+            "latest_return": 0.0,
+            "latest_price": price,
+            "trading_days_since_signal": 0,
+        }
+
+        new_df = pd.DataFrame(
+            [new_row]
         )
 
-    if not new_rows:
-        return tracking
+        if tracking.empty:
 
-    new_df = pd.DataFrame(
-        new_rows
-    )
+            tracking = new_df[
+                TRACKING_COLUMNS
+            ].copy()
 
-    if tracking.empty:
-        return new_df[
-            TRACKING_COLUMNS
-        ]
+        else:
 
-    return pd.concat(
-        [
-            tracking,
-            new_df,
-        ],
-        ignore_index=True,
-    )[
+            tracking = pd.concat(
+                [
+                    tracking,
+                    new_df,
+                ],
+                ignore_index=True,
+            )
+
+    return tracking[
         TRACKING_COLUMNS
-    ]
+    ].copy()
 
+
+# =============================================================
+# Main Tracking Function
+# =============================================================
 
 def update_ignition_tracking(
     ignition,
@@ -376,6 +430,10 @@ def update_ignition_tracking(
         / "ignition_tracking.csv"
     )
 
+    # =========================================================
+    # Load Existing Tracking
+    # =========================================================
+
     if tracking_path.exists():
 
         try:
@@ -385,7 +443,14 @@ def update_ignition_tracking(
                 encoding="utf-8-sig",
             )
 
-        except Exception:
+        except Exception as exc:
+
+            print(
+                "[tracking] "
+                "failed to read existing "
+                "ignition_tracking.csv: "
+                f"{exc}"
+            )
 
             tracking = (
                 _empty_tracking()
@@ -397,25 +462,28 @@ def update_ignition_tracking(
             _empty_tracking()
         )
 
-    # ---------------------------------------------------------
-    # Schema migration
+    # =========================================================
+    # Schema Migration
     #
-    # 未來增加欄位時，
-    # 舊 tracking.csv 仍可繼續使用。
-    # ---------------------------------------------------------
+    # 如果未來增加欄位，
+    # 舊 tracking.csv 仍能繼續使用。
+    # =========================================================
 
     for column in TRACKING_COLUMNS:
 
         if column not in tracking.columns:
-            tracking[column] = np.nan
+
+            tracking[
+                column
+            ] = np.nan
 
     tracking = tracking[
         TRACKING_COLUMNS
     ].copy()
 
-    # ---------------------------------------------------------
-    # 先加入今天首次出現的 Ignition
-    # ---------------------------------------------------------
+    # =========================================================
+    # Add Today's First Ignition Signals
+    # =========================================================
 
     tracking = _append_new_signals(
         tracking,
@@ -423,9 +491,9 @@ def update_ignition_tracking(
         data_date,
     )
 
-    # ---------------------------------------------------------
-    # 再用目前已有行情更新所有歷史 Signal
-    # ---------------------------------------------------------
+    # =========================================================
+    # Update All Historical Signals
+    # =========================================================
 
     if not tracking.empty:
 
@@ -433,38 +501,83 @@ def update_ignition_tracking(
 
         for _, row in tracking.iterrows():
 
-            updated_rows.append(
+            updated_row = (
                 _update_one_signal(
                     row.copy(),
                     close,
                 )
             )
 
+            updated_rows.append(
+                updated_row
+            )
+
         tracking = pd.DataFrame(
             updated_rows
         )
 
+    # =========================================================
+    # Normalize Schema
+    # =========================================================
+
+    for column in TRACKING_COLUMNS:
+
+        if column not in tracking.columns:
+
+            tracking[
+                column
+            ] = np.nan
+
     tracking = tracking[
         TRACKING_COLUMNS
-    ]
+    ].copy()
+
+    # =========================================================
+    # Sort
+    # =========================================================
 
     if not tracking.empty:
 
-        tracking = tracking.sort_values(
-            [
-                "signal_date",
-                "ignition_score",
-            ],
-            ascending=[
-                False,
-                False,
-            ],
+        tracking[
+            "signal_date"
+        ] = (
+            tracking[
+                "signal_date"
+            ]
+            .astype(str)
         )
+
+        tracking = (
+            tracking
+            .sort_values(
+                [
+                    "signal_date",
+                    "ignition_score",
+                ],
+                ascending=[
+                    False,
+                    False,
+                ],
+            )
+            .reset_index(
+                drop=True
+            )
+        )
+
+    # =========================================================
+    # Save
+    # =========================================================
 
     tracking.to_csv(
         tracking_path,
         index=False,
         encoding="utf-8-sig",
+    )
+
+    print(
+        "[tracking] "
+        f"{len(tracking)} "
+        "Ignition Day 0 signals tracked."
     )
 
     return tracking
