@@ -4,15 +4,34 @@ import pandas as pd
 import yfinance as yf
 
 
-def _normalize_download(data):
+def _download_batch(tickers, period):
     """
-    Normalize yfinance output into close / volume DataFrames.
+    Fast path:
+    download a batch of tickers in parallel.
+    """
+    return yf.download(
+        tickers=tickers,
+        period=period,
+        auto_adjust=True,
+        progress=False,
+        threads=True,          # 恢復平行下載
+        group_by="column",
+    )
+
+
+def _extract_batch(data, batch):
+    """
+    Convert yfinance batch output into:
+    close DataFrame
+    volume DataFrame
     """
 
     if data is None or data.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # 多股票下載
+    # ---------------------------------------------------------
+    # Multiple ticker format
+    # ---------------------------------------------------------
     if isinstance(data.columns, pd.MultiIndex):
 
         level0 = data.columns.get_level_values(0)
@@ -22,8 +41,15 @@ def _normalize_download(data):
 
         close = data["Close"].copy()
 
+        if isinstance(close, pd.Series):
+            close = close.to_frame()
+
         if "Volume" in level0:
             volume = data["Volume"].copy()
+
+            if isinstance(volume, pd.Series):
+                volume = volume.to_frame()
+
         else:
             volume = pd.DataFrame(
                 index=close.index,
@@ -31,68 +57,45 @@ def _normalize_download(data):
                 dtype=float,
             )
 
-        # 單一 ticker 有時仍會變 Series
-        if isinstance(close, pd.Series):
-            close = close.to_frame()
-
-        if isinstance(volume, pd.Series):
-            volume = volume.to_frame()
-
         return close, volume
 
-    # 單股票格式
+    # ---------------------------------------------------------
+    # Single ticker batch
+    # ---------------------------------------------------------
     if "Close" not in data.columns:
         return pd.DataFrame(), pd.DataFrame()
 
+    ticker = batch[0]
+
     close = data[["Close"]].copy()
-    close.columns = ["Close"]
+    close.columns = [ticker]
 
     if "Volume" in data.columns:
         volume = data[["Volume"]].copy()
-        volume.columns = ["Volume"]
+        volume.columns = [ticker]
     else:
         volume = pd.DataFrame(
             index=data.index,
-            columns=["Volume"],
+            columns=[ticker],
             dtype=float,
         )
 
     return close, volume
 
 
-def _download_batch(tickers, period):
+def _download_single(ticker, period, max_retries=3):
     """
-    Normal batch download.
-    """
+    Slow recovery path.
 
-    return yf.download(
-        tickers=tickers,
-        period=period,
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-        group_by="column",
-    )
+    Only tickers missing from the parallel batch download
+    come here.
 
-
-def _download_single(
-    ticker,
-    period,
-    max_retries=3,
-):
-    """
-    Retry a failed ticker individually.
-
-    This handles transient yfinance / SQLite / network errors
-    without failing the whole radar run.
+    Retry individually with threads disabled.
     """
 
     last_error = None
 
-    for attempt in range(
-        1,
-        max_retries + 1,
-    ):
+    for attempt in range(1, max_retries + 1):
 
         try:
 
@@ -103,44 +106,75 @@ def _download_single(
                 progress=False,
                 threads=False,
                 group_by="column",
+                timeout=10,
             )
 
-            if (
-                data is not None
-                and not data.empty
-                and "Close" in data.columns
-                and data["Close"].notna().any()
-            ):
+            if data is not None and not data.empty:
 
-                close = (
-                    data["Close"]
-                    .rename(ticker)
-                )
+                # Single ticker may still return MultiIndex
+                if isinstance(data.columns, pd.MultiIndex):
 
-                if "Volume" in data.columns:
+                    if "Close" not in data.columns.get_level_values(0):
+                        raise ValueError("Close column missing")
 
-                    volume = (
-                        data["Volume"]
-                        .rename(ticker)
-                    )
+                    close_obj = data["Close"]
+
+                    if isinstance(close_obj, pd.DataFrame):
+                        if close_obj.shape[1] == 0:
+                            raise ValueError("Close data empty")
+                        close = close_obj.iloc[:, 0]
+                    else:
+                        close = close_obj
+
+                    if "Volume" in data.columns.get_level_values(0):
+
+                        volume_obj = data["Volume"]
+
+                        if isinstance(volume_obj, pd.DataFrame):
+                            if volume_obj.shape[1] > 0:
+                                volume = volume_obj.iloc[:, 0]
+                            else:
+                                volume = pd.Series(
+                                    index=data.index,
+                                    dtype=float,
+                                )
+                        else:
+                            volume = volume_obj
+
+                    else:
+                        volume = pd.Series(
+                            index=data.index,
+                            dtype=float,
+                        )
 
                 else:
 
-                    volume = pd.Series(
-                        index=data.index,
-                        name=ticker,
-                        dtype=float,
-                    )
+                    if "Close" not in data.columns:
+                        raise ValueError("Close column missing")
 
-                return (
-                    close,
-                    volume,
-                    None,
-                )
+                    close = data["Close"]
 
-            last_error = (
-                "empty or invalid response"
-            )
+                    if "Volume" in data.columns:
+                        volume = data["Volume"]
+                    else:
+                        volume = pd.Series(
+                            index=data.index,
+                            dtype=float,
+                        )
+
+                close = close.dropna()
+
+                if not close.empty:
+
+                    close.name = ticker
+                    volume.name = ticker
+
+                    return close, volume, None
+
+                last_error = "empty Close data"
+
+            else:
+                last_error = "empty response"
 
         except Exception as exc:
 
@@ -150,46 +184,32 @@ def _download_single(
 
         if attempt < max_retries:
 
-            wait_seconds = 2 ** (
-                attempt - 1
-            )
+            wait_seconds = 2 ** (attempt - 1)
 
             print(
                 f"[retry] {ticker}: "
-                f"attempt {attempt} failed; "
-                f"retrying in {wait_seconds}s"
+                f"attempt {attempt}/{max_retries} failed "
+                f"({last_error}); "
+                f"retry in {wait_seconds}s"
             )
 
-            time.sleep(
-                wait_seconds
-            )
+            time.sleep(wait_seconds)
 
-    return (
-        None,
-        None,
-        last_error,
-    )
+    return None, None, last_error
 
 
-def download_prices(
-    tickers,
-    period,
-    batch_size,
-):
+def download_prices(tickers, period, batch_size):
     """
-    Download market data with graceful recovery.
+    Production download strategy:
 
-    Flow:
-    1. Download in batches.
-    2. Detect tickers with missing Close data.
-    3. Retry failed tickers individually.
-    4. Keep successfully recovered tickers.
-    5. Report final failures without killing the full run.
+    1. Parallel batch download for speed.
+    2. Detect missing/invalid tickers.
+    3. Retry ONLY those tickers individually.
+    4. Keep NaN volume as NaN.
+    5. A few failed tickers do not kill the radar.
     """
 
-    tickers = list(
-        dict.fromkeys(tickers)
-    )
+    tickers = list(dict.fromkeys(tickers))
 
     all_close = []
     all_volume = []
@@ -197,7 +217,8 @@ def download_prices(
     failed_candidates = set()
 
     # =========================================================
-    # Batch downloads
+    # FAST PATH
+    # Parallel batch downloads
     # =========================================================
 
     for start in range(
@@ -217,112 +238,74 @@ def download_prices(
                 period,
             )
 
-            close, volume = (
-                _normalize_download(data)
+            close, volume = _extract_batch(
+                data,
+                batch,
             )
 
         except Exception as exc:
 
             print(
-                "[batch error] "
-                f"{batch[0]} ... "
-                f"{batch[-1]}: "
+                f"[batch error] "
+                f"{batch[0]} ... {batch[-1]}: "
                 f"{type(exc).__name__}: {exc}"
             )
 
-            failed_candidates.update(
-                batch
-            )
-
+            failed_candidates.update(batch)
             continue
 
-        # -----------------------------------------------------
-        # yfinance column names
-        # -----------------------------------------------------
+        if close.empty:
 
-        if not close.empty:
+            failed_candidates.update(batch)
+            continue
 
-            # Multi-ticker output should already have ticker names.
-            # For one-item batch, normalize the generic column name.
-            if (
-                len(batch) == 1
-                and len(close.columns) == 1
-            ):
+        valid_tickers = []
 
-                close.columns = [
-                    batch[0]
-                ]
+        for ticker in batch:
 
-                volume.columns = [
-                    batch[0]
-                ]
+            if ticker not in close.columns:
 
-            valid_close = []
+                failed_candidates.add(ticker)
+                continue
 
-            for ticker in batch:
+            if close[ticker].dropna().empty:
 
-                if ticker not in close.columns:
-                    failed_candidates.add(
-                        ticker
-                    )
-                    continue
+                failed_candidates.add(ticker)
+                continue
 
-                series = (
-                    close[ticker]
-                    .dropna()
-                )
+            valid_tickers.append(ticker)
 
-                if series.empty:
-                    failed_candidates.add(
-                        ticker
-                    )
-                    continue
+        if valid_tickers:
 
-                valid_close.append(
-                    ticker
-                )
+            close_out = close[
+                valid_tickers
+            ].copy()
 
-            if valid_close:
-
-                all_close.append(
-                    close[
-                        valid_close
-                    ]
-                )
-
-                available_volume = [
-                    ticker
-                    for ticker in valid_close
-                    if ticker
-                    in volume.columns
-                ]
-
-                volume_out = pd.DataFrame(
-                    index=close.index,
-                    columns=valid_close,
-                    dtype=float,
-                )
-
-                if available_volume:
-
-                    volume_out[
-                        available_volume
-                    ] = volume[
-                        available_volume
-                    ]
-
-                all_volume.append(
-                    volume_out
-                )
-
-        else:
-
-            failed_candidates.update(
-                batch
+            volume_out = pd.DataFrame(
+                index=close_out.index,
+                columns=valid_tickers,
+                dtype=float,
             )
 
+            available_volume = [
+                ticker
+                for ticker in valid_tickers
+                if ticker in volume.columns
+            ]
+
+            if available_volume:
+
+                volume_out[
+                    available_volume
+                ] = volume[
+                    available_volume
+                ]
+
+            all_close.append(close_out)
+            all_volume.append(volume_out)
+
     # =========================================================
-    # Combine successful batch data
+    # Combine fast-path results
     # =========================================================
 
     if all_close:
@@ -347,20 +330,38 @@ def download_prices(
 
         volume_all = pd.DataFrame()
 
+    # Remove duplicate columns defensively
+    if not close_all.empty:
+
+        close_all = close_all.loc[
+            :,
+            ~close_all.columns.duplicated(
+                keep="last"
+            ),
+        ]
+
+    if not volume_all.empty:
+
+        volume_all = volume_all.loc[
+            :,
+            ~volume_all.columns.duplicated(
+                keep="last"
+            ),
+        ]
+
     # =========================================================
-    # Detect any missing ticker even if yfinance did not raise
+    # Detect anything batch download silently missed
     # =========================================================
 
-    successful = set(
-        close_all.columns
-    )
+    successful = set(close_all.columns)
 
     failed_candidates.update(
         set(tickers) - successful
     )
 
     # =========================================================
-    # Individual retries
+    # SLOW PATH
+    # Retry ONLY failed tickers
     # =========================================================
 
     final_failed = []
@@ -368,14 +369,13 @@ def download_prices(
     if failed_candidates:
 
         print(
-            "\n[recovery] "
-            f"retrying {len(failed_candidates)} "
-            "ticker(s) individually..."
+            f"\n[recovery] "
+            f"{len(failed_candidates)} ticker(s) "
+            "missing from batch download; "
+            "starting individual retry..."
         )
 
-    for ticker in sorted(
-        failed_candidates
-    ):
+    for ticker in sorted(failed_candidates):
 
         close_series, volume_series, error = (
             _download_single(
@@ -388,22 +388,20 @@ def download_prices(
         if close_series is None:
 
             final_failed.append(
-                (
-                    ticker,
-                    error,
-                )
+                (ticker, error)
             )
 
             continue
 
-        # 如果 batch 階段曾產生同名欄位，
-        # retry 成功後以 retry 結果覆蓋。
+        # Remove stale/partial version if present
         if ticker in close_all.columns:
+
             close_all = close_all.drop(
                 columns=[ticker]
             )
 
         if ticker in volume_all.columns:
+
             volume_all = volume_all.drop(
                 columns=[ticker]
             )
@@ -429,7 +427,7 @@ def download_prices(
         )
 
     # =========================================================
-    # Final cleanup
+    # Final validation
     # =========================================================
 
     if close_all.empty:
@@ -438,19 +436,19 @@ def download_prices(
             "No market price data could be downloaded."
         )
 
-    # 移除完全沒有價格資料的欄位
     close_all = close_all.dropna(
         axis=1,
         how="all",
     )
 
-    # Volume 對齊 Close，但缺量保持 NaN
+    # Align volume with Close.
+    # IMPORTANT: missing volume remains NaN.
     volume_all = volume_all.reindex(
         index=close_all.index,
         columns=close_all.columns,
     )
 
-    # 排序，讓結果每次比較穩定
+    # Stable ordering
     close_all = close_all.sort_index(
         axis=1
     )
@@ -460,15 +458,27 @@ def download_prices(
     )
 
     # =========================================================
-    # Final failure report
+    # Download quality report
     # =========================================================
+
+    downloaded_count = len(
+        close_all.columns
+    )
+
+    total_count = len(tickers)
+
+    print(
+        f"\n[market] "
+        f"downloaded {downloaded_count}/"
+        f"{total_count} tickers"
+    )
 
     if final_failed:
 
         print(
-            "\nWARNING: "
+            f"[market warning] "
             f"{len(final_failed)} ticker(s) "
-            "still failed after retry:"
+            "failed after all retries:"
         )
 
         for ticker, error in final_failed:
@@ -477,16 +487,19 @@ def download_prices(
                 f"  - {ticker}: {error}"
             )
 
+    elif failed_candidates:
+
+        print(
+            "[market] "
+            "all missing tickers recovered."
+        )
+
     else:
 
-        if failed_candidates:
+        print(
+            "[market] "
+            "batch download complete; "
+            "no recovery needed."
+        )
 
-            print(
-                "\n[recovery] "
-                "all failed tickers recovered."
-            )
-
-    return (
-        close_all,
-        volume_all,
-    )
+    return close_all, volume_all
