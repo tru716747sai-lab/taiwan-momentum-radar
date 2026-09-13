@@ -1,0 +1,29 @@
+universe:
+  markets: [TWSE, TPEx]
+  exclude_etf: true
+  min_price: 10
+  min_history_days: 280
+  min_avg_turnover_twd: 20000000
+
+download:
+  period: "2y"
+  batch_size: 100
+
+score:
+  momentum_weight: 0.45
+  trend_weight: 0.25
+  liquidity_weight: 0.15
+  risk_weight: 0.15
+  momentum_horizons:
+    "20": 0.10
+    "60": 0.25
+    "120": 0.30
+    "252": 0.35
+
+output:
+  top_n: 10
+
+backtest:
+  top_n: 10
+  rebalance: "ME"
+  transaction_cost_bps: 20
