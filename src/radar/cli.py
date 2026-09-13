@@ -1,19 +1,66 @@
-import argparse, json
+import argparse
+
 from .config import load_config
 from .pipeline import run
-from .backtest import run_backtest
+
+
+def _print_table(title, df, score_col):
+    print(f"\n=== {title} ===")
+
+    if df.empty:
+        print("今日無符合條件標的")
+        return
+
+    columns = [
+        c
+        for c in [
+            "ticker",
+            "name",
+            score_col,
+        ]
+        if c in df.columns
+    ]
+
+    print(
+        df[columns]
+        .to_string(index=False)
+    )
+
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["run","backtest"])
-    p.add_argument("--config", default="config/settings.yaml")
-    args = p.parse_args()
-    cfg = load_config(args.config)
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "command",
+        choices=["run"],
+    )
+
+    args = parser.parse_args()
+
     if args.command == "run":
-        top = run(cfg)
-        print(top[["ticker","name","score"]].to_string(index=False))
-    else:
-        print(json.dumps(run_backtest(cfg), indent=2, ensure_ascii=False))
+
+        result = run(
+            load_config()
+        )
+
+        _print_table(
+            "STRONG",
+            result["strong"],
+            "score",
+        )
+
+        _print_table(
+            "BREAKOUT",
+            result["breakout"],
+            "breakout_score",
+        )
+
+        _print_table(
+            "IGNITION",
+            result["ignition"],
+            "ignition_score",
+        )
+
 
 if __name__ == "__main__":
     main()
